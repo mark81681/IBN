@@ -86,6 +86,8 @@ class WsMetricsClient:
                 backoff = min(backoff * 2, 30.0)
 
     async def _run_once(self):
+        global current_policy
+
         prev = read_proc_net_dev()
         prev_t = time.time()
         send_accum = 0.0
@@ -128,26 +130,24 @@ class WsMetricsClient:
                     }
                     await ws.send(json.dumps(msg))
 
-                    # 서버가 NOOP 같은 응답을 보내도록 되어 있어서 한번 읽어줌(버퍼 방지)
                     try:
                         reply = await asyncio.wait_for(ws.recv(), timeout=2.0)
                         print("[WS] reply:", reply)
 
                         data = json.loads(reply)
                         msg_type = data.get("type")
-                    
+
                         if msg_type == "POLICY":
                             policy = data.get("policy", {})
-                            global current_policy
                             current_policy = policy
                             print("[WS] POLICY updated:", current_policy)
-                    
+
                         elif msg_type == "NOOP":
                             pass
-                    
+
                         elif msg_type == "ERROR":
                             print("[WS] server error:", data)
-                    
+
                     except asyncio.TimeoutError:
                         pass
 
