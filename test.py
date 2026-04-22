@@ -16,6 +16,11 @@ RTMP_URL = "rtmp://104.208.89.250/live/jetson1"
 WS_URL = "ws://104.208.89.250/ws/jetson"
 DEVICE_ID = "jetson1"
 IFACES = ["wlan0", "eth2"]
+current_policy = {
+    "mode": "wifi_only",
+    "wifi_ratio": 1.0,
+    "lte_ratio": 0.0
+}
 
 SAMPLE_INTERVAL_SEC = 1.0   # /proc/net/dev 샘플링 간격
 SEND_INTERVAL_SEC = 2.0     # 서버로 METRICS 보내는 간격
@@ -119,12 +124,30 @@ class WsMetricsClient:
                         "type": "METRICS",
                         "device_id": self.device_id,
                         "ifaces": ifaces_payload,
+                        "policy": current_policy,
                     }
                     await ws.send(json.dumps(msg))
 
                     # 서버가 NOOP 같은 응답을 보내도록 되어 있어서 한번 읽어줌(버퍼 방지)
                     try:
-                        _ = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        reply = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        print("[WS] reply:", reply)
+
+                        data = json.loads(reply)
+                        msg_type = data.get("type")
+                    
+                        if msg_type == "POLICY":
+                            policy = data.get("policy", {})
+                            global current_policy
+                            current_policy = policy
+                            print("[WS] POLICY updated:", current_policy)
+                    
+                        elif msg_type == "NOOP":
+                            pass
+                    
+                        elif msg_type == "ERROR":
+                            print("[WS] server error:", data)
+                    
                     except asyncio.TimeoutError:
                         pass
 
