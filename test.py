@@ -10,10 +10,10 @@ import websockets  # 추가 (pip install --user websockets)
 
 WIDTH, HEIGHT = 640, 480
 
-RTMP_URL = "rtmp://104.208.89.250/live/jetson1"
+RTMP_URL = "rtmp://20.41.100.163/live/jetson1"
 
 # WS는 VM1(게이트웨이)로 붙으면 됨 (VM1 -> VM2 프록시)
-WS_URL = "ws://104.208.89.250/ws/jetson"
+WS_URL = "ws://20.41.100.163/ws/jetson"
 DEVICE_ID = "jetson1"
 IFACES = ["wlan0", "eth2"]
 current_policy = {
