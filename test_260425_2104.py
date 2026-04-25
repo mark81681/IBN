@@ -260,8 +260,6 @@ ws_client.start()
 
 try:
     while True:
-        global pending_policy_apply, pending_policy_value, display_rtmp
-
         # 새 policy 적용 요청이 있으면 여기서 실제 route 변경 + RTMP 재연결
         if pending_policy_apply and pending_policy_value is not None:
             print("[MAIN] applying pending policy:", pending_policy_value)
