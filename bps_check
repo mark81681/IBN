@@ -1,0 +1,7 @@
+W0=$(cat /sys/class/net/wlan0/statistics/tx_bytes); \
+E0=$(cat /sys/class/net/eth2/statistics/tx_bytes); \
+sleep 1; \
+W1=$(cat /sys/class/net/wlan0/statistics/tx_bytes); \
+E1=$(cat /sys/class/net/eth2/statistics/tx_bytes); \
+echo "wifi_tx_mbps=$(echo "scale=6; ($W1-$W0)*8/1000000" | bc)"; \
+echo "lte_tx_mbps=$(echo "scale=6; ($E1-$E0)*8/1000000" | bc)"
