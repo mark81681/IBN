@@ -15,7 +15,7 @@ WIDTH, HEIGHT = 640, 480
 # RTMP는 그대로 유지
 RTMP_URL = "rtmp://20.41.100.163/live/jetson1"
 
-# WS는 기존처럼 VM1(public)으로 연결
+# WS도 그대로 유지
 WS_URL = "ws://20.41.100.163/ws/jetson"
 DEVICE_ID = "jetson1"
 
@@ -23,15 +23,14 @@ WIFI_IFACE = "wlan0"
 LTE_IFACE = "eth2"
 IFACES = [WIFI_IFACE, LTE_IFACE]
 
-# 그래프를 움직이기 위한 테스트 트래픽 목적지
-# UDP는 수신 서버가 없어도 송신량(TX)은 인터페이스에 찍힙니다.
+# 그래프를 움직이기 위한 UDP 테스트 트래픽 목적지
 TRAFFIC_TARGET_HOST = "20.41.100.163"
 TRAFFIC_TARGET_PORT = 9999
 
-# 테스트 트래픽 총 bitrate (그래프가 보일 정도로)
+# 테스트 트래픽 총량
 TOTAL_TEST_TRAFFIC_BPS = 2_000_000   # 2 Mbps
 UDP_PAYLOAD_SIZE = 1200              # bytes
-TRAFFIC_TICK_SEC = 0.05              # 50ms마다 분배
+TRAFFIC_TICK_SEC = 0.05              # 50ms
 
 SAMPLE_INTERVAL_SEC = 1.0   # /proc/net/dev 샘플링 간격
 SEND_INTERVAL_SEC = 2.0     # 서버로 METRICS 보내는 간격
@@ -95,7 +94,6 @@ def get_iface_ipv4(iface):
     if result.returncode != 0 or not result.stdout.strip():
         return None
 
-    # 예: "3: wlan0    inet 192.168.0.110/24 brd ..."
     parts = result.stdout.split()
     if "inet" not in parts:
         return None
@@ -106,9 +104,8 @@ def get_iface_ipv4(iface):
 
 def make_bound_udp_socket(iface):
     """
-    특정 인터페이스로 나가도록 바인딩된 UDP 소켓 생성.
-    - source IP bind
-    - SO_BINDTODEVICE
+    특정 인터페이스의 source IP로만 bind한 UDP 소켓 생성.
+    SO_BINDTODEVICE는 사용하지 않음.
     """
     src_ip = get_iface_ipv4(iface)
     if not src_ip:
@@ -116,12 +113,8 @@ def make_bound_udp_socket(iface):
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    # source IP 바인드
+    # source IP만 바인드 (권한 문제 없음)
     s.bind((src_ip, 0))
-
-    # Linux 전용: 특정 인터페이스로 강제
-    SO_BINDTODEVICE = 25
-    s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode() + b"\x00")
 
     return s
 
@@ -129,7 +122,7 @@ def make_bound_udp_socket(iface):
 class UdpTrafficGenerator:
     """
     RTMP와 별개로, 그래프를 움직이기 위한 테스트 UDP 트래픽 생성기.
-    policy에 따라 wlan0 / eth2 / ratio 분배를 수행.
+    policy에 따라 wlan0 / eth2 / ratio 분배.
     """
     def __init__(self, target_host, target_port):
         self.target = (target_host, target_port)
@@ -149,16 +142,19 @@ class UdpTrafficGenerator:
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=5)
+
         try:
             if self.wifi_sock:
                 self.wifi_sock.close()
         except Exception:
             pass
+
         try:
             if self.lte_sock:
                 self.lte_sock.close()
         except Exception:
             pass
+
         print("[TRAFFIC] generator stopped")
 
     def _thread_main(self):
@@ -215,7 +211,7 @@ class UdpTrafficGenerator:
 class WsMetricsClient:
     """
     WebSocket 연결 유지 + HELLO + 주기적 METRICS 전송.
-    policy 수신 시 current_policy를 갱신.
+    policy 수신 시 current_policy 갱신.
     """
     def __init__(self, ws_url: str, device_id: str, ifaces):
         self.ws_url = ws_url
@@ -253,7 +249,6 @@ class WsMetricsClient:
         send_accum = 0.0
 
         async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
-            # HELLO
             await ws.send(json.dumps({"type": "HELLO", "device_id": self.device_id}))
             hello_ack = await ws.recv()
             print("[WS] HELLO_ACK:", hello_ack)
@@ -283,7 +278,6 @@ class WsMetricsClient:
                 if send_accum >= SEND_INTERVAL_SEC:
                     send_accum = 0.0
 
-                    # 디버그용 출력
                     print("[METRICS SEND]", ifaces_payload, "| policy=", get_policy())
 
                     msg = {
@@ -347,14 +341,11 @@ try:
             print("Capture Failed")
             break
 
-        # 1. Detect
         dets = net.Detect(img, w, h)
 
-        # 2. Render
         if display_local and display_local.IsStreaming():
             display_local.Render(img)
 
-            # 현재 policy 표시
             policy = get_policy()
             mode = policy.get("mode", "unknown")
             display_local.SetStatus(f"{net.GetNetworkFPS():.0f} FPS | {mode}")
