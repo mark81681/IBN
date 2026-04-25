@@ -1,3 +1,8 @@
+# wifi, lte
+# sudo ip route replace default via 192.168.0.1 dev wlan0 metric 100
+# sudo ip route replace default via 192.168.8.1 dev eth2 metric 600
+
+
 import jetson_inference
 import jetson_utils
 import time
