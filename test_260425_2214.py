@@ -6,7 +6,6 @@ import asyncio
 import json
 import random
 import socket
-import subprocess
 
 import websockets  # pip install --user websockets
 
@@ -15,7 +14,7 @@ WIDTH, HEIGHT = 640, 480
 # RTMP는 그대로 유지
 RTMP_URL = "rtmp://20.41.100.163/live/jetson1"
 
-# WS도 그대로 유지
+# WebSocket도 그대로 유지
 WS_URL = "ws://20.41.100.163/ws/jetson"
 DEVICE_ID = "jetson1"
 
@@ -23,11 +22,13 @@ WIFI_IFACE = "wlan0"
 LTE_IFACE = "eth2"
 IFACES = [WIFI_IFACE, LTE_IFACE]
 
-# 그래프를 움직이기 위한 UDP 테스트 트래픽 목적지
-TRAFFIC_TARGET_HOST = "20.41.100.163"
-TRAFFIC_TARGET_PORT = 9999
+# 각 인터페이스의 gateway
+WIFI_GW = "192.168.0.1"
+LTE_GW = "192.168.8.1"
 
-# 테스트 트래픽 총량
+# 그래프용 UDP 테스트 트래픽 설정
+# 각 gateway로 보내면 해당 인터페이스를 통해 나감
+TRAFFIC_TARGET_PORT = 9999
 TOTAL_TEST_TRAFFIC_BPS = 2_000_000   # 2 Mbps
 UDP_PAYLOAD_SIZE = 1200              # bytes
 TRAFFIC_TICK_SEC = 0.05              # 50ms
@@ -81,80 +82,32 @@ def mbps(delta_bytes, dt_sec):
     return (delta_bytes * 8.0) / 1_000_000.0 / dt_sec
 
 
-def get_iface_ipv4(iface):
-    """
-    인터페이스의 IPv4 주소를 가져온다.
-    예: wlan0 -> 192.168.0.110
-    """
-    result = subprocess.run(
-        ["ip", "-4", "-o", "addr", "show", "dev", iface],
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-
-    parts = result.stdout.split()
-    if "inet" not in parts:
-        return None
-    idx = parts.index("inet")
-    cidr = parts[idx + 1]
-    return cidr.split("/")[0]
-
-
-def make_bound_udp_socket(iface):
-    """
-    특정 인터페이스의 source IP로만 bind한 UDP 소켓 생성.
-    SO_BINDTODEVICE는 사용하지 않음.
-    """
-    src_ip = get_iface_ipv4(iface)
-    if not src_ip:
-        raise RuntimeError(f"{iface} IPv4 주소를 찾지 못했습니다.")
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    # source IP만 바인드 (권한 문제 없음)
-    s.bind((src_ip, 0))
-
-    return s
-
-
 class UdpTrafficGenerator:
     """
     RTMP와 별개로, 그래프를 움직이기 위한 테스트 UDP 트래픽 생성기.
-    policy에 따라 wlan0 / eth2 / ratio 분배.
+    policy에 따라 WIFI_GW / LTE_GW 로 UDP를 보냄.
     """
-    def __init__(self, target_host, target_port):
-        self.target = (target_host, target_port)
+    def __init__(self):
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._thread_main, daemon=True)
-
         self.payload = b"x" * UDP_PAYLOAD_SIZE
-        self.wifi_sock = None
-        self.lte_sock = None
+
+        self.wifi_target = (WIFI_GW, TRAFFIC_TARGET_PORT)
+        self.lte_target = (LTE_GW, TRAFFIC_TARGET_PORT)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def start(self):
-        self.wifi_sock = make_bound_udp_socket(WIFI_IFACE)
-        self.lte_sock = make_bound_udp_socket(LTE_IFACE)
         self.thread.start()
         print("[TRAFFIC] generator started")
 
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=5)
-
         try:
-            if self.wifi_sock:
-                self.wifi_sock.close()
+            self.sock.close()
         except Exception:
             pass
-
-        try:
-            if self.lte_sock:
-                self.lte_sock.close()
-        except Exception:
-            pass
-
         print("[TRAFFIC] generator stopped")
 
     def _thread_main(self):
@@ -172,10 +125,10 @@ class UdpTrafficGenerator:
             mode = policy.get("mode", "wifi_only")
 
             if mode == "wifi_only":
-                self._send_packets(self.wifi_sock, packets_per_tick)
+                self._send_packets(self.wifi_target, packets_per_tick)
 
             elif mode == "lte_only":
-                self._send_packets(self.lte_sock, packets_per_tick)
+                self._send_packets(self.lte_target, packets_per_tick)
 
             elif mode == "ratio":
                 wifi_ratio = float(policy.get("wifi_ratio", 0.5) or 0.5)
@@ -193,16 +146,16 @@ class UdpTrafficGenerator:
                 lte_packets = max(0, packets_per_tick - wifi_packets)
 
                 if wifi_packets > 0:
-                    self._send_packets(self.wifi_sock, wifi_packets)
+                    self._send_packets(self.wifi_target, wifi_packets)
                 if lte_packets > 0:
-                    self._send_packets(self.lte_sock, lte_packets)
+                    self._send_packets(self.lte_target, lte_packets)
 
             time.sleep(TRAFFIC_TICK_SEC)
 
-    def _send_packets(self, sock, n):
+    def _send_packets(self, target, n):
         for _ in range(n):
             try:
-                sock.sendto(self.payload, self.target)
+                self.sock.sendto(self.payload, target)
             except Exception as e:
                 print("[TRAFFIC] send error:", repr(e))
                 break
@@ -326,7 +279,7 @@ cnt_local = 0
 cnt_rtmp = 0
 
 # 그래프용 테스트 트래픽 생성기 시작
-traffic_gen = UdpTrafficGenerator(TRAFFIC_TARGET_HOST, TRAFFIC_TARGET_PORT)
+traffic_gen = UdpTrafficGenerator()
 traffic_gen.start()
 
 # WS metrics 클라이언트 시작
@@ -360,7 +313,7 @@ try:
                 print("[rtmp]======================")
                 cnt_rtmp += 1
 
-        # 테스트용 종료(원하면 제거해서 무한 실행 가능)
+        # 테스트용 종료 (원하면 제거해서 무한 실행 가능)
         if time.time() - start > 120:
             print("Timeout Exit")
             break
