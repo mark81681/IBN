@@ -1,21 +1,30 @@
+# wifi, lte 우선순위 변경
+sudo ip route replace default via 192.168.0.1 dev wlam0 metric 100
+sudo ip route replace default via 192.168.8.1 dev eth2 metric 600
+
+# 기존 설정했던 거 정리
 sudo ip rule del from 192.168.0.110/32 table wifi 2>/dev/null
 sudo ip rule del from 192.168.8.100/32 table lte 2>/dev/null
 sudo ip route flush table wifi
 sudo ip route flush table lte
 
+# 새 route 넣기
 sudo ip route add 192.168.0.0/24 dev wlan0 src 192.168.0.110 table wifi
 sudo ip route add default via 192.168.0.1 dev wlan0 table wifi
 
 sudo ip route add 192.168.8.0/24 dev eth2 src 192.168.8.100 table lte
 sudo ip route add default via 192.168.8.1 dev eth2 table lte
 
+# 새 rule 넣기
 sudo ip rule add from 192.168.0.110/32 table wifi priority 100
 sudo ip rule add from 192.168.8.100/32 table lte priority 200
 
+# rp_filter 완화
 sudo sysctl -w net.ipv4.conf.all.rp_filter=2
 sudo sysctl -w net.ipv4.conf.wlan0.rp_filter=2
 sudo sysctl -w net.ipv4.conf.eth2.rp_filter=2
 
+# 확인
 ip rule
 ip route show table wifi
 ip route show table lte
