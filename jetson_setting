@@ -1,0 +1,22 @@
+sudo ip rule del from 192.168.0.110/32 table wifi 2>/dev/null
+sudo ip rule del from 192.168.8.100/32 table lte 2>/dev/null
+sudo ip route flush table wifi
+sudo ip route flush table lte
+
+sudo ip route add 192.168.0.0/24 dev wlan0 src 192.168.0.110 table wifi
+sudo ip route add default via 192.168.0.1 dev wlan0 table wifi
+
+sudo ip route add 192.168.8.0/24 dev eth2 src 192.168.8.100 table lte
+sudo ip route add default via 192.168.8.1 dev eth2 table lte
+
+sudo ip rule add from 192.168.0.110/32 table wifi priority 100
+sudo ip rule add from 192.168.8.100/32 table lte priority 200
+
+sudo sysctl -w net.ipv4.conf.all.rp_filter=2
+sudo sysctl -w net.ipv4.conf.wlan0.rp_filter=2
+sudo sysctl -w net.ipv4.conf.eth2.rp_filter=2
+
+ip rule
+ip route show table wifi
+ip route show table lte
+
