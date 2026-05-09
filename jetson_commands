@@ -1,0 +1,94 @@
+# 1. TCP 3-way handshake 측정
+# Jetson -> 서버: SYN
+# 서버 -> Jetson: SYN + ACK 
+# Jetson -> 서버: ACK
+
+# wifi
+python3 -c "import socket,time; t=time.time(); s=socket.socket(); s.settimeout(3); s.bind(('192.168.0.110',0)); s.connect(('20.41.100.163',9001)); print('wifi_tcp_connect_ms=', round((time.time()-t)*1000,2)); s.close()"
+# lte
+python3 -c "import socket,time; t=time.time(); s=socket.socket(); s.settimeout(3); s.bind(('192.168.8.100',0)); s.connect(('20.41.100.163',9001)); print('lte_tcp_connect_ms=', round((time.time()-t)*1000,2)); s.close()"
+
+
+# 2. TCP RTT 측정
+# wifi TCP echo RTT
+python3 -c "import socket,time; s=socket.socket(); s.settimeout(3); s.bind(('192.168.0.110',0)); s.connect(('20.41.100.163',9001)); t=time.time(); s.sendall(b'PING'); data=s.recv(4); print('wifi_tcp_echo_rtt_ms=', round((time.time()-t)*1000,2), 'data=', data); s.close()"
+# lte TCP echo RTT
+python3 -c "import socket,time; s=socket.socket(); s.settimeout(3); s.bind(('192.168.8.100',0)); s.connect(('20.41.100.163',9001)); t=time.time(); s.sendall(b'PING'); data=s.recv(4); print('lte_tcp_echo_rtt_ms=', round((time.time()-t)*1000,2), 'data=', data); s.close()"
+
+
+
+
+# 3. TCP throughput 측정
+
+
+
+
+# 4. TCP Loss 측정
+# TCP connect fail rate
+# wifi 10회
+for i in $(seq 1 10); do python3 -c "import socket; s=socket.socket(); s.settimeout(2); s.bind(('192.168.0.110',0)); s.connect(('20.41.100.163',9001)); s.close(); print('ok')" 2>/dev/null || echo fail; done
+# lte 10회
+for i in $(seq 1 10); do python3 -c "import socket; s=socket.socket(); s.settimeout(2); s.bind(('192.168.8.100',0)); s.connect(('20.41.100.163',9001)); s.close(); print('ok')" 2>/dev/null || echo fail; done
+
+
+# 5. TCP Jitter 측정
+# 엄밀하게는 TCP connect time varitation
+# wifi
+# python3 - <<'PY'
+import socket, time, statistics
+
+SRC_IP = "192.168.0.110"
+DST_IP = "20.41.100.163"
+DST_PORT = 9001
+N = 10
+
+vals = []
+fails = 0
+
+for _ in range(N):
+    try:
+        s = socket.socket()
+        s.settimeout(2)
+        s.bind((SRC_IP, 0))
+        t = time.time()
+        s.connect((DST_IP, DST_PORT))
+        vals.append((time.time() - t) * 1000)
+        s.close()
+    except Exception:
+        fails += 1
+
+print("wifi_tcp_connect_samples_ms=", [round(v, 2) for v in vals])
+print("wifi_tcp_connect_avg_ms=", round(statistics.mean(vals), 2) if vals else None)
+print("wifi_tcp_connect_jitter_std_ms=", round(statistics.pstdev(vals), 2) if len(vals) > 1 else 0)
+print("wifi_tcp_fail_rate=", fails / N)
+PY
+
+# lte
+python3 - <<'PY'
+import socket, time, statistics
+
+SRC_IP = "192.168.8.100"
+DST_IP = "20.41.100.163"
+DST_PORT = 9001
+N = 10
+
+vals = []
+fails = 0
+
+for _ in range(N):
+    try:
+        s = socket.socket()
+        s.settimeout(2)
+        s.bind((SRC_IP, 0))
+        t = time.time()
+        s.connect((DST_IP, DST_PORT))
+        vals.append((time.time() - t) * 1000)
+        s.close()
+    except Exception:
+        fails += 1
+
+print("lte_tcp_connect_samples_ms=", [round(v, 2) for v in vals])
+print("lte_tcp_connect_avg_ms=", round(statistics.mean(vals), 2) if vals else None)
+print("lte_tcp_connect_jitter_std_ms=", round(statistics.pstdev(vals), 2) if len(vals) > 1 else 0)
+print("lte_tcp_fail_rate=", fails / N)
+PY
