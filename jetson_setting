@@ -1,4 +1,4 @@
-cd /etc/iproutes2
+cd /etc/iproute2
 
 # wifi, lte 우선순위 변경
 sudo ip route replace default via 192.168.0.1 dev wlan0 metric 100
