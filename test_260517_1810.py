@@ -38,10 +38,10 @@ TRAFFIC_TICK_SEC = 0.1               # 100ms마다 분배
 TCP_CHUNK_SIZE = 8192                # 한 번에 보낼 바이트 수
 
 # CMDP state용 TCP 상태 측정 설정
-TCP_STATE_PROBE_INTERVAL_SEC = 5.0    # TCP 상태 묶음을 갱신하는 목표 주기
-TCP_CONNECT_PROBE_COUNT = 5           # connect time variation / success rate 계산용 시도 횟수
-TCP_PROBE_TIMEOUT_SEC = 2.0           # 개별 TCP probe timeout
-TCP_CONNECT_PROBE_GAP_SEC = 0.05      # connect probe 사이 짧은 간격
+TCP_STATE_PROBE_INTERVAL_SEC = 5.0    # TCP 상태값 갱신 주기
+TCP_CONNECT_PROBE_COUNT = 5           # connect time variation 계산용 시도 횟수
+TCP_PROBE_TIMEOUT_SEC = 2.0           # 각 TCP probe timeout
+TCP_CONNECT_PROBE_GAP_SEC = 0.05      # connect probe 사이 간격
 
 policy_lock = threading.Lock()
 current_policy = {
@@ -50,18 +50,19 @@ current_policy = {
     "lte_ratio": 0.0
 }
 
-# CMDP state로 VM2에 전달할 최신 TCP 상태값
+# TCP 상태값 최신 결과
 tcp_state_lock = threading.Lock()
 latest_tcp_state = {
     "wifi_tcp_rtt_ms": None,
     "lte_tcp_rtt_ms": None,
     "wifi_tcp_connect_variation_ms": None,
-    "lte_tcp_connect_variation_ms": None,
-    "wifi_tcp_success_rate": 0.0,
-    "lte_tcp_success_rate": 0.0
+    "lte_tcp_connect_variation_ms": None
 }
 
 
+# =========================
+# 1) 공용 상태 함수
+# =========================
 def get_policy():
     with policy_lock:
         return dict(current_policy)
@@ -83,24 +84,42 @@ def set_tcp_state(new_state):
         latest_tcp_state.update(new_state)
 
 
+def fmt_num(value, digits=6):
+    """
+    로그 출력용 숫자 포맷.
+    None이면 N/A로 표시.
+    """
+    if value is None:
+        return "N/A"
+    return f"{float(value):.{digits}f}"
+
+
+# =========================
+# 2) 인터페이스 TX/RX 측정
+# =========================
 def read_proc_net_dev():
     """
     /proc/net/dev에서 인터페이스별 누적 RX/TX 바이트를 읽는다.
     반환: {iface: (rx_bytes, tx_bytes)}
     """
     out = {}
+
     with open("/proc/net/dev", "r", encoding="utf-8") as f:
         lines = f.readlines()
 
     for line in lines[2:]:
         if ":" not in line:
             continue
+
         iface, data = line.split(":", 1)
         iface = iface.strip()
         fields = data.split()
+
         rx_bytes = int(fields[0])
         tx_bytes = int(fields[8])
+
         out[iface] = (rx_bytes, tx_bytes)
+
     return out
 
 
@@ -110,6 +129,9 @@ def mbps(delta_bytes, dt_sec):
     return (delta_bytes * 8.0) / 1_000_000.0 / dt_sec
 
 
+# =========================
+# 3) 인터페이스 IP / TCP 소켓 생성
+# =========================
 def get_iface_ipv4(iface: str):
     """
     인터페이스 IPv4 주소 가져오기
@@ -120,10 +142,12 @@ def get_iface_ipv4(iface: str):
         capture_output=True,
         text=True
     )
+
     if result.returncode != 0 or not result.stdout.strip():
         return None
 
     parts = result.stdout.split()
+
     if "inet" not in parts:
         return None
 
@@ -133,7 +157,8 @@ def get_iface_ipv4(iface: str):
 
 def create_bound_tcp_socket(src_ip: str):
     """
-    source IP를 지정해서 TCP 소켓 생성 후 반환
+    TCP 테스트 트래픽 전송용 장기 연결 소켓 생성.
+    source IP를 지정해서 WiFi/LTE 경로를 분리한다.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -145,7 +170,7 @@ def create_bound_tcp_socket(src_ip: str):
 def create_probe_socket(src_ip: str) -> socket.socket:
     """
     TCP 상태 측정 전용 소켓 생성.
-    실제 트래픽 생성용 장기 연결과 분리해서 사용한다.
+    장기 트래픽 연결과 분리해서 사용한다.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(TCP_PROBE_TIMEOUT_SEC)
@@ -164,27 +189,33 @@ def recv_exact(sock: socket.socket, expected_len: int) -> bytes:
 
     while received < expected_len:
         chunk = sock.recv(expected_len - received)
+
         if not chunk:
             raise RuntimeError("socket closed before receiving expected bytes")
+
         chunks.append(chunk)
         received += len(chunk)
 
     return b"".join(chunks)
 
 
+# =========================
+# 4) TCP 상태 측정 함수
+# =========================
 def measure_tcp_connect_once_ms(src_ip: str) -> float:
     """
     TCP connect time 측정.
-    - timer는 connect() 직전에 시작
-    - connect()가 반환될 때까지의 시간 측정
-    - 실험적으로 TCP 3-way handshake 완료 지연을 반영하는 값
+    connect() 직전부터 connect() 반환 시점까지 걸린 시간을 잰다.
+    TCP 3-way handshake 완료 지연을 반영하는 값이다.
     """
     s = create_probe_socket(src_ip)
+
     try:
         start = time.perf_counter()
         s.connect((TCP_TARGET_HOST, TCP_TARGET_PORT))
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return elapsed_ms
+
     finally:
         try:
             s.close()
@@ -195,28 +226,32 @@ def measure_tcp_connect_once_ms(src_ip: str) -> float:
 def measure_tcp_application_rtt_once_ms(src_ip: str) -> float:
     """
     TCP application-level RTT 측정.
-    별도 probe 연결을 만든 뒤:
-    - VM2 TCP 서버로 PING 송신
-    - VM2가 돌려주는 PONG 수신
-    - sendall(PING) 직전부터 recv(PONG) 완료까지의 왕복 시간 측정
 
-    주의:
-    - connect time은 이 값에 포함하지 않는다.
-    - VM2 서버가 b"PING"에 대해 b"PONG"을 반환해야 한다.
+    절차:
+    1. 별도 probe TCP 연결 생성
+    2. VM2 TCP 서버로 b"PING" 전송
+    3. VM2가 b"PONG" 응답
+    4. sendall(PING) 직전부터 recv(PONG) 완료까지 시간을 측정
+
+    connect time은 이 RTT 값에 포함하지 않는다.
     """
     s = create_probe_socket(src_ip)
+
     try:
         s.connect((TCP_TARGET_HOST, TCP_TARGET_PORT))
 
         start = time.perf_counter()
+
         s.sendall(b"PING")
         reply = recv_exact(s, 4)
+
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         if reply != b"PONG":
             raise RuntimeError(f"unexpected RTT probe reply: {reply!r}")
 
         return elapsed_ms
+
     finally:
         try:
             s.close()
@@ -228,13 +263,9 @@ def measure_path_tcp_state(path_name: str, iface: str) -> dict:
     """
     특정 경로(WiFi 또는 LTE)의 TCP 상태값을 측정한다.
 
-    반환값:
-    - tcp_rtt_ms:
-        TCP application-level RTT
-    - tcp_connect_variation_ms:
-        여러 connect time 샘플의 표준편차
-    - tcp_success_rate:
-        여러 connect probe 중 성공 비율
+    반환:
+    - tcp_rtt_ms
+    - tcp_connect_variation_ms
     """
     src_ip = get_iface_ipv4(iface)
 
@@ -242,60 +273,62 @@ def measure_path_tcp_state(path_name: str, iface: str) -> dict:
         print(f"[TCP STATE] {path_name}: {iface} IPv4 주소를 찾지 못했습니다.")
         return {
             "tcp_rtt_ms": None,
-            "tcp_connect_variation_ms": None,
-            "tcp_success_rate": 0.0
+            "tcp_connect_variation_ms": None
         }
 
+    # 1) TCP application-level RTT 측정
     tcp_rtt_ms = None
-    try:
-        tcp_rtt_ms = round(measure_tcp_application_rtt_once_ms(src_ip), 6)
-    except Exception as e:
-        print(f"[TCP STATE] {path_name} RTT probe failed:", repr(e))
 
+    try:
+        tcp_rtt_ms = round(
+            measure_tcp_application_rtt_once_ms(src_ip),
+            6
+        )
+    except Exception as e:
+        print(f"[TCP STATE] {path_name} RTT probe failed: {repr(e)}")
+
+    # 2) TCP connect time variation 측정
     connect_samples_ms = []
-    success_count = 0
 
     for _ in range(TCP_CONNECT_PROBE_COUNT):
         try:
             connect_ms = measure_tcp_connect_once_ms(src_ip)
             connect_samples_ms.append(connect_ms)
-            success_count += 1
         except Exception as e:
-            print(f"[TCP STATE] {path_name} connect probe failed:", repr(e))
+            print(f"[TCP STATE] {path_name} connect probe failed: {repr(e)}")
 
         time.sleep(TCP_CONNECT_PROBE_GAP_SEC)
 
-    success_rate = success_count / float(TCP_CONNECT_PROBE_COUNT)
-
     if len(connect_samples_ms) >= 2:
-        connect_variation_ms = round(statistics.pstdev(connect_samples_ms), 6)
+        connect_variation_ms = round(
+            statistics.pstdev(connect_samples_ms),
+            6
+        )
     else:
         connect_variation_ms = None
 
     return {
         "tcp_rtt_ms": tcp_rtt_ms,
-        "tcp_connect_variation_ms": connect_variation_ms,
-        "tcp_success_rate": round(success_rate, 6)
+        "tcp_connect_variation_ms": connect_variation_ms
     }
 
 
 class TcpStateProbe:
     """
-    CMDP state용 TCP 상태값을 백그라운드에서 주기적으로 갱신한다.
+    CMDP state용 TCP 상태값을 백그라운드에서 주기적으로 측정한다.
 
     측정값:
     - wifi_tcp_rtt_ms
     - lte_tcp_rtt_ms
     - wifi_tcp_connect_variation_ms
     - lte_tcp_connect_variation_ms
-    - wifi_tcp_success_rate
-    - lte_tcp_success_rate
-
-    WiFi/LTE 측정은 서로 영향을 덜 주도록 동시에 실행한다.
     """
     def __init__(self):
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread = threading.Thread(
+            target=self._thread_main,
+            daemon=True
+        )
 
     def start(self):
         self.thread.start()
@@ -312,8 +345,16 @@ class TcpStateProbe:
 
             try:
                 with ThreadPoolExecutor(max_workers=2) as executor:
-                    wifi_future = executor.submit(measure_path_tcp_state, "WiFi", WIFI_IFACE)
-                    lte_future = executor.submit(measure_path_tcp_state, "LTE", LTE_IFACE)
+                    wifi_future = executor.submit(
+                        measure_path_tcp_state,
+                        "WiFi",
+                        WIFI_IFACE
+                    )
+                    lte_future = executor.submit(
+                        measure_path_tcp_state,
+                        "LTE",
+                        LTE_IFACE
+                    )
 
                     wifi_state = wifi_future.result()
                     lte_state = lte_future.result()
@@ -322,13 +363,18 @@ class TcpStateProbe:
                     "wifi_tcp_rtt_ms": wifi_state["tcp_rtt_ms"],
                     "lte_tcp_rtt_ms": lte_state["tcp_rtt_ms"],
                     "wifi_tcp_connect_variation_ms": wifi_state["tcp_connect_variation_ms"],
-                    "lte_tcp_connect_variation_ms": lte_state["tcp_connect_variation_ms"],
-                    "wifi_tcp_success_rate": wifi_state["tcp_success_rate"],
-                    "lte_tcp_success_rate": lte_state["tcp_success_rate"]
+                    "lte_tcp_connect_variation_ms": lte_state["tcp_connect_variation_ms"]
                 }
 
                 set_tcp_state(merged_state)
-                print("[TCP STATE]", merged_state)
+
+                print(
+                    "\n[TCP STATE UPDATE]\n"
+                    f"WiFi TCP RTT: {fmt_num(merged_state['wifi_tcp_rtt_ms'])} ms\n"
+                    f"LTE  TCP RTT: {fmt_num(merged_state['lte_tcp_rtt_ms'])} ms\n"
+                    f"WiFi TCP Connect Variation: {fmt_num(merged_state['wifi_tcp_connect_variation_ms'])} ms\n"
+                    f"LTE  TCP Connect Variation: {fmt_num(merged_state['lte_tcp_connect_variation_ms'])} ms\n"
+                )
 
             except Exception as e:
                 print("[TCP STATE] probe cycle error:", repr(e))
@@ -340,6 +386,9 @@ class TcpStateProbe:
                 self.stop_event.wait(timeout=sleep_sec)
 
 
+# =========================
+# 5) WiFi/LTE TCP 테스트 트래픽 생성기
+# =========================
 class DualTcpTrafficGenerator:
     """
     WiFi용 TCP 연결 1개, LTE용 TCP 연결 1개를 미리 열어두고
@@ -347,7 +396,10 @@ class DualTcpTrafficGenerator:
     """
     def __init__(self):
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread = threading.Thread(
+            target=self._thread_main,
+            daemon=True
+        )
 
         self.wifi_sock = None
         self.lte_sock = None
@@ -363,6 +415,7 @@ class DualTcpTrafficGenerator:
 
         if not self.wifi_ip:
             raise RuntimeError(f"{WIFI_IFACE} IPv4 주소를 찾지 못했습니다.")
+
         if not self.lte_ip:
             raise RuntimeError(f"{LTE_IFACE} IPv4 주소를 찾지 못했습니다.")
 
@@ -404,68 +457,108 @@ class DualTcpTrafficGenerator:
 
     def _send_bytes(self, sock, total_bytes: int):
         remain = total_bytes
+
         while remain > 0:
             chunk = min(TCP_CHUNK_SIZE, remain)
+
             try:
                 sent = sock.send(self.payload[:chunk])
+
                 if sent <= 0:
                     raise RuntimeError("socket send returned 0")
+
                 remain -= sent
+
             except Exception as e:
                 print("[TCP] send error:", repr(e))
                 break
 
     def _run(self):
-        bytes_per_tick = int((TOTAL_TEST_TRAFFIC_BPS / 8.0) * TRAFFIC_TICK_SEC)
+        bytes_per_tick = int(
+            (TOTAL_TEST_TRAFFIC_BPS / 8.0) * TRAFFIC_TICK_SEC
+        )
 
         while not self.stop_event.is_set():
             policy = get_policy()
             mode = policy.get("mode", "wifi_only")
 
             if mode == "wifi_only":
-                self._send_bytes(self.wifi_sock, bytes_per_tick)
+                self._send_bytes(
+                    self.wifi_sock,
+                    bytes_per_tick
+                )
 
             elif mode == "lte_only":
-                self._send_bytes(self.lte_sock, bytes_per_tick)
+                self._send_bytes(
+                    self.lte_sock,
+                    bytes_per_tick
+                )
 
             elif mode == "ratio":
-                wifi_ratio = float(policy.get("wifi_ratio", 0.5) or 0.5)
-                lte_ratio = float(policy.get("lte_ratio", 0.5) or 0.5)
+                wifi_ratio = float(
+                    policy.get("wifi_ratio", 0.5) or 0.5
+                )
+                lte_ratio = float(
+                    policy.get("lte_ratio", 0.5) or 0.5
+                )
 
                 total = wifi_ratio + lte_ratio
+
                 if total <= 0:
-                    wifi_ratio, lte_ratio = 0.5, 0.5
+                    wifi_ratio = 0.5
+                    lte_ratio = 0.5
                     total = 1.0
 
                 wifi_ratio /= total
                 lte_ratio /= total
 
-                wifi_bytes = int(bytes_per_tick * wifi_ratio)
-                lte_bytes = max(0, bytes_per_tick - wifi_bytes)
+                wifi_bytes = int(
+                    bytes_per_tick * wifi_ratio
+                )
+                lte_bytes = max(
+                    0,
+                    bytes_per_tick - wifi_bytes
+                )
 
                 if wifi_bytes > 0:
-                    self._send_bytes(self.wifi_sock, wifi_bytes)
+                    self._send_bytes(
+                        self.wifi_sock,
+                        wifi_bytes
+                    )
+
                 if lte_bytes > 0:
-                    self._send_bytes(self.lte_sock, lte_bytes)
+                    self._send_bytes(
+                        self.lte_sock,
+                        lte_bytes
+                    )
 
             else:
                 # 알 수 없는 mode면 안전하게 wifi_only처럼 동작
-                self._send_bytes(self.wifi_sock, bytes_per_tick)
+                self._send_bytes(
+                    self.wifi_sock,
+                    bytes_per_tick
+                )
 
             time.sleep(TRAFFIC_TICK_SEC)
 
 
+# =========================
+# 6) WebSocket METRICS 클라이언트
+# =========================
 class WsMetricsClient:
     """
     WebSocket 연결 유지 + HELLO + 주기적 METRICS 전송.
-    policy 수신 시 current_policy를 갱신.
+    POLICY 수신 시 current_policy를 갱신한다.
     """
     def __init__(self, ws_url: str, device_id: str, ifaces):
         self.ws_url = ws_url
         self.device_id = device_id
         self.ifaces = list(ifaces)
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread = threading.Thread(
+            target=self._thread_main,
+            daemon=True
+        )
 
     def start(self):
         self.thread.start()
@@ -479,14 +572,18 @@ class WsMetricsClient:
 
     async def _run(self):
         backoff = 1.0
+
         while not self.stop_event.is_set():
             try:
                 await self._run_once()
                 backoff = 1.0
+
             except Exception as e:
                 print("[WS] error:", repr(e))
+
                 wait = backoff + random.random() * 0.2
                 print(f"[WS] reconnecting in {wait:.1f}s...")
+
                 await asyncio.sleep(wait)
                 backoff = min(backoff * 2, 30.0)
 
@@ -495,8 +592,16 @@ class WsMetricsClient:
         prev_t = time.time()
         send_accum = 0.0
 
-        async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
-            await ws.send(json.dumps({"type": "HELLO", "device_id": self.device_id}))
+        async with websockets.connect(
+            self.ws_url,
+            ping_interval=20,
+            ping_timeout=20
+        ) as ws:
+            await ws.send(json.dumps({
+                "type": "HELLO",
+                "device_id": self.device_id
+            }))
+
             hello_ack = await ws.recv()
             print("[WS] HELLO_ACK:", hello_ack)
 
@@ -508,14 +613,17 @@ class WsMetricsClient:
                 dt = now_t - prev_t
 
                 ifaces_payload = {}
+
                 for iface in self.ifaces:
                     if iface not in now or iface not in prev:
                         continue
+
                     rx0, tx0 = prev[iface]
                     rx1, tx1 = now[iface]
+
                     ifaces_payload[iface] = {
                         "rx_mbps": round(mbps(rx1 - rx0, dt), 6),
-                        "tx_mbps": round(mbps(tx1 - tx0, dt), 6),
+                        "tx_mbps": round(mbps(tx1 - tx0, dt), 6)
                     }
 
                 prev = now
@@ -526,14 +634,33 @@ class WsMetricsClient:
                     send_accum = 0.0
 
                     tcp_state_payload = get_tcp_state()
+                    policy_now = get_policy()
+
+                    wifi_metrics = ifaces_payload.get(WIFI_IFACE, {})
+                    lte_metrics = ifaces_payload.get(LTE_IFACE, {})
+
+                    wifi_rx = float(wifi_metrics.get("rx_mbps", 0.0))
+                    wifi_tx = float(wifi_metrics.get("tx_mbps", 0.0))
+                    lte_rx = float(lte_metrics.get("rx_mbps", 0.0))
+                    lte_tx = float(lte_metrics.get("tx_mbps", 0.0))
+
+                    wifi_tcp_rtt = tcp_state_payload.get("wifi_tcp_rtt_ms")
+                    lte_tcp_rtt = tcp_state_payload.get("lte_tcp_rtt_ms")
+
+                    wifi_ratio = float(
+                        policy_now.get("wifi_ratio", 0.0) or 0.0
+                    )
+                    lte_ratio = float(
+                        policy_now.get("lte_ratio", 0.0) or 0.0
+                    )
 
                     print(
-                        "[METRICS SEND]",
-                        ifaces_payload,
-                        "| tcp_state=",
-                        tcp_state_payload,
-                        "| policy=",
-                        get_policy()
+                        "\n[METRICS SEND]\n"
+                        f"WiFi | RX: {wifi_rx:.6f} Mbps | TX: {wifi_tx:.6f} Mbps\n"
+                        f"LTE  | RX: {lte_rx:.6f} Mbps | TX: {lte_tx:.6f} Mbps\n"
+                        f"WiFi TCP RTT: {fmt_num(wifi_tcp_rtt)} ms\n"
+                        f"LTE  TCP RTT: {fmt_num(lte_tcp_rtt)} ms\n"
+                        f"Policy = {{wifi_ratio: {wifi_ratio:.4f}, lte_ratio: {lte_ratio:.4f}}}\n"
                     )
 
                     msg = {
@@ -541,12 +668,17 @@ class WsMetricsClient:
                         "device_id": self.device_id,
                         "ifaces": ifaces_payload,
                         "tcp_state": tcp_state_payload,
-                        "policy": get_policy(),
+                        "policy": policy_now
                     }
+
                     await ws.send(json.dumps(msg))
 
                     try:
-                        reply = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        reply = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=2.0
+                        )
+
                         print("[WS] reply:", reply)
 
                         data = json.loads(reply)
@@ -567,9 +699,19 @@ class WsMetricsClient:
                         pass
 
 
-# -------------------- 기존 영상 코드 --------------------
-net = jetson_inference.detectNet("ssd-mobilenet-v2", threshold=0.5)
-camera = jetson_utils.gstCamera(WIDTH, HEIGHT, "/dev/video0")
+# =========================
+# 7) 기존 영상 코드
+# =========================
+net = jetson_inference.detectNet(
+    "ssd-mobilenet-v2",
+    threshold=0.5
+)
+
+camera = jetson_utils.gstCamera(
+    WIDTH,
+    HEIGHT,
+    "/dev/video0"
+)
 
 display_local = jetson_utils.videoOutput()
 display_rtmp = jetson_utils.videoOutput(RTMP_URL)
@@ -591,7 +733,11 @@ tcp_state_probe = TcpStateProbe()
 tcp_state_probe.start()
 
 # WS metrics 클라이언트 시작
-ws_client = WsMetricsClient(WS_URL, DEVICE_ID, IFACES)
+ws_client = WsMetricsClient(
+    WS_URL,
+    DEVICE_ID,
+    IFACES
+)
 ws_client.start()
 
 try:
@@ -609,7 +755,10 @@ try:
 
             policy = get_policy()
             mode = policy.get("mode", "unknown")
-            display_local.SetStatus(f"{net.GetNetworkFPS():.0f} FPS | {mode}")
+
+            display_local.SetStatus(
+                f"{net.GetNetworkFPS():.0f} FPS | {mode}"
+            )
 
             if cnt_local == 0:
                 print("[local]=====================")
@@ -617,6 +766,7 @@ try:
 
         if display_rtmp:
             display_rtmp.Render(img)
+
             if cnt_rtmp == 0:
                 print("[rtmp]======================")
                 cnt_rtmp += 1
